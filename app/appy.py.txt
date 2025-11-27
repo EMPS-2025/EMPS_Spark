@@ -1,0 +1,268 @@
+# app/app.py
+import os
+import sys
+import traceback
+from datetime import date
+from dataclasses import replace
+from typing import Dict, List, Any, Optional
+import chainlit as cl
+from openai import OpenAI
+
+# Add project root to path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from core.config import Config
+from core.database import DatabaseManager
+from parsers.bulletproof_parser import BulletproofParser
+from presenters.enhanced_response_builder import EnhancedResponseBuilder
+from presenters.chart_generator import generate_market_chart
+from utils.formatters import label_hour_ranges, label_slot_ranges
+
+# Initialize
+config = Config()
+db = DatabaseManager(config)
+parser = BulletproofParser(config)
+response_builder = EnhancedResponseBuilder()
+openai_client = OpenAI(api_key=config.OPENAI_API_KEY) if config.OPENAI_API_KEY else None
+
+@cl.on_chat_start
+async def start_session():
+    await cl.Message(content="👋 **EM-SPARK Ready.** Ask about DAM/GDAM/RTM.").send()
+
+def describe_time_selection(spec, total_specs=1) -> Dict[str, Any]:
+    """Generate human-readable time labels."""
+    if spec.granularity == "quarter" and spec.slots:
+        slots = sorted(set(spec.slots))
+        time_label, _, count = label_slot_ranges(slots)
+        duration_hours = count * 0.25
+        pretty_label = f"{time_label} (All India)"
+    else:
+        hours = sorted(set(spec.hours or list(range(1, 25))))
+        time_label, _, count = label_hour_ranges(hours)
+        
+        if count >= 24:
+            pretty_label = "00:00–24:00 hrs"
+        else:
+            pretty_label = f"{time_label} hrs"
+        duration_hours = float(count)
+        
+    if total_specs > 1:
+        pretty_label += " [Multi-Period]"
+
+    return {'time_label': pretty_label, 'duration_hours': round(duration_hours, 2)}
+
+def calculate_segments(rows: List[Dict]) -> Dict[str, Any]:
+    """Calculate Peak, Off-Peak, and Solar segment metrics."""
+    # Definitions (1-based blocks)
+    solar_blocks = set(range(9, 19)) # 08:00 - 18:00
+    peak_blocks = set(range(19, 24)) # 18:00 - 23:00
+    
+    segments = {
+        'solar': {'prices': [], 'volumes': []},
+        'peak': {'prices': [], 'volumes': []},
+        'off_peak': {'prices': [], 'volumes': []}
+    }
+    
+    for row in rows:
+        if 'block_index' in row:
+            idx = row['block_index']
+        elif 'slot_index' in row:
+            idx = (row['slot_index'] - 1) // 4 + 1
+        else:
+            continue
+            
+        price = row['price_avg'] / 1000.0 # Rs/kWh
+        vol = row.get('mcv_mw', 0)
+        if row.get('duration_min') == 15:
+             vol_mwh = vol * 0.25
+        else:
+             vol_mwh = vol / 4.0 
+        
+        if idx in solar_blocks:
+            segments['solar']['prices'].append(price)
+            segments['solar']['volumes'].append(vol_mwh)
+        elif idx in peak_blocks:
+            segments['peak']['prices'].append(price)
+            segments['peak']['volumes'].append(vol_mwh)
+        else:
+            segments['off_peak']['prices'].append(price)
+            segments['off_peak']['volumes'].append(vol_mwh)
+            
+    results = {}
+    for key, data in segments.items():
+        if data['prices']:
+            twap = sum(data['prices']) / len(data['prices'])
+            vol = sum(data['volumes']) / 1000.0 # GWh
+            results[key] = {'twap': twap, 'volume_gwh': vol, 'count': len(data['prices'])}
+        else:
+            results[key] = {'count': 0}
+    return results
+
+def compute_aggregated_metrics(rows: List[Dict], granularity: str) -> Dict[str, Any]:
+    if not rows:
+        return {k: 0.0 for k in ['purchase_bid_total_mw', 'sell_bid_total_mw', 'twap', 'min_price', 'max_price', 'total_volume_gwh']}
+    
+    prices = []
+    mwh_volumes = []
+    purchase_bids = []
+    sell_bids = []
+    
+    for row in rows:
+        prices.append(row['price_avg'])
+        purchase_bids.append(row['purchase_bid_mw'])
+        sell_bids.append(row['sell_bid_mw'])
+        
+        if granularity == 'quarter':
+            mwh_volumes.append(row['mcv_mw'] * 0.25)
+        else:
+            mwh_volumes.append(row['mcv_mw'] / 4.0)
+
+    twap_mwh = sum(prices) / len(prices) if prices else 0.0
+    total_vol_mwh = sum(mwh_volumes)
+    avg_buy_mw = sum(purchase_bids) / len(purchase_bids) if purchase_bids else 0.0
+    avg_sell_mw = sum(sell_bids) / len(sell_bids) if sell_bids else 0.0
+    
+    return {
+        'purchase_bid_total_mw': avg_buy_mw,
+        'sell_bid_total_mw': avg_sell_mw,
+        'twap': twap_mwh / 1000.0,
+        'min_price': min(prices) / 1000.0 if prices else 0.0,
+        'max_price': max(prices) / 1000.0 if prices else 0.0,
+        'total_volume_gwh': total_vol_mwh / 1000.0,
+        'rows': rows
+    }
+
+async def fetch_aggregated_market_data(specs: List[Any], market_override: str = None) -> Dict[str, Any]:
+    all_rows = []
+    granularity = "hour"
+    
+    for spec in specs:
+        target_market = market_override if market_override else spec.market
+        target_spec = replace(spec, market=target_market)
+        granularity = target_spec.granularity
+        
+        if target_spec.granularity == 'quarter':
+            rows = db.fetch_quarter(target_market, target_spec.start_date, target_spec.end_date, None, None)
+        else:
+            rows = db.fetch_hourly(target_market, target_spec.start_date, target_spec.end_date, None, None)
+            
+        filtered = []
+        if target_spec.granularity == "quarter" or (target_spec.slots and len(target_spec.slots) > 0):
+            allowed_slots = set(target_spec.slots or range(1, 97))
+            for row in rows:
+                if row['slot_index'] in allowed_slots:
+                    filtered.append(row)
+        else:
+            allowed_hours = set(target_spec.hours or range(1, 25))
+            for row in rows:
+                if row['block_index'] in allowed_hours:
+                    filtered.append(row)
+        all_rows.extend(filtered)
+        
+    return compute_aggregated_metrics(all_rows, granularity)
+
+@cl.on_message
+async def handle_message(msg: cl.Message):
+    progress_msg = cl.Message(content="🤖 Processing...")
+    await progress_msg.send()
+    
+    try:
+        user_query = msg.content.strip()
+        specs = parser.parse(user_query)
+        
+        if not specs:
+             await progress_msg.remove()
+             await cl.Message(content="⚠️ Could not parse query.").send()
+             return
+
+        primary_market = specs[0].market
+        selection_details = describe_time_selection(specs[0], total_specs=len(specs))
+        
+        all_market_data = {}
+        all_market_prev_year = {}
+        
+        for m in ["DAM", "GDAM", "RTM"]:
+            all_market_data[m] = await fetch_aggregated_market_data(specs, market_override=m)
+            
+            prev_specs = []
+            for s in specs:
+                try:
+                    prev_s = s.start_date.replace(year=s.start_date.year - 1)
+                    prev_e = s.end_date.replace(year=s.end_date.year - 1)
+                    prev_specs.append(replace(s, start_date=prev_s, end_date=prev_e))
+                except ValueError:
+                    pass
+            
+            if prev_specs:
+                all_market_prev_year[m] = await fetch_aggregated_market_data(prev_specs, market_override=m)
+            else:
+                all_market_prev_year[m] = {}
+
+        primary_data = all_market_data.get(primary_market, {})
+        segments = calculate_segments(primary_data.get('rows', []))
+        deriv_data = db.fetch_derivative_data(specs[0].start_date)
+        
+        chart_element = None
+        if primary_data.get('rows'):
+            fig = generate_market_chart(
+                primary_market,
+                selection_details['time_label'],
+                primary_data['rows'],
+                is_quarterly=(specs[0].granularity == 'quarter')
+            )
+            if fig:
+                chart_element = cl.Plotly(name="Market Graph", figure=fig, display="inline")
+
+        insights = [
+            f"{primary_market} TWAP: ₹{primary_data['twap']:.2f}/kWh",
+            f"Total Volume: {primary_data['total_volume_gwh']:.2f} GWh",
+            f"Buy Bids: {primary_data['purchase_bid_total_mw']:.0f} MW",
+            f"Sell Bids: {primary_data['sell_bid_total_mw']:.0f} MW"
+        ]
+        
+        if len(specs) > 1:
+            date_label = f"{len(specs)} Periods (Multi-Select)"
+        else:
+            if specs[0].start_date == specs[0].end_date:
+                date_label = f"{specs[0].start_date}"
+            else:
+                date_label = f"{specs[0].start_date} to {specs[0].end_date}"
+
+        sections = [
+            response_builder.build_overview_header(
+                f"Spot Market ({primary_market})", 
+                date_label, 
+                selection_details, user_query
+            ),
+            response_builder.build_snapshot_card(
+                primary_market,
+                date_label,
+                selection_details['time_label'],
+                primary_data['twap'],
+                primary_data['min_price'],
+                primary_data['max_price'],
+                primary_data['total_volume_gwh']
+            ),
+            response_builder.build_derivative_section(deriv_data),
+            response_builder.build_segment_analysis(segments),
+            response_builder.build_market_comparison_section(
+                specs[0].start_date.year,
+                all_market_data,
+                all_market_prev_year
+            ),
+            "[[Market Graph]]",
+            response_builder.build_ai_insights_section(insights)
+        ]
+        
+        response_text = response_builder.compose_dashboard(sections)
+        
+        await progress_msg.remove()
+        await cl.Message(
+            content=response_text,
+            elements=[chart_element] if chart_element else []
+        ).send()
+
+    except Exception as e:
+        traceback.print_exc()
+        await progress_msg.remove()
+        await cl.Message(content=f"❌ Error: {str(e)}").send()
