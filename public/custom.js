@@ -479,3 +479,45 @@
 //   setTimeout(onReady, 1000);
 
 // })();
+
+// --- Active enhancements ---
+// Keep new assistant messages anchored to the top so users can read from the beginning.
+(() => {
+  const scrollToTop = (el) => {
+    if (!el) return;
+    requestAnimationFrame(() => {
+      try {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start', inline: 'nearest' });
+      } catch (e) {
+        // Optional UX helper; ignore errors.
+      }
+    });
+  };
+
+  const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (!(node instanceof HTMLElement)) continue;
+
+        const target = node.matches?.('[data-testid="chat-message"]')
+          ? node
+          : node.querySelector?.('[data-testid="chat-message"]');
+
+        if (target) {
+          scrollToTop(target);
+          return;
+        }
+      }
+    }
+  });
+
+  const startObserver = () => {
+    observer.observe(document.body, { childList: true, subtree: true });
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', startObserver);
+  } else {
+    startObserver();
+  }
+})();
