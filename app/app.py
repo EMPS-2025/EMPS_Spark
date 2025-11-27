@@ -405,7 +405,8 @@ async def handle_message(msg: cl.Message):
             prev_year_data=all_market_prev_year,
             derivative_data=deriv_data,
             insights=insights,
-            derivative_note=deriv_note
+            derivative_note=deriv_note,
+            total_market_vol=total_market_vol
         )
 
         primary_chart = chart_elements[0] if chart_elements else None

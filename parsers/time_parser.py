@@ -22,7 +22,9 @@ class TimeParser:
         lower = text.lower()
         
         # Check for explicit granularity hints
-        prefer_quarter = bool(re.search(r'\b(blocks?|slots?|quarters?)\b', lower))
+        prefer_quarter = bool(
+            re.search(r'\b(blocks?|slots?|quarters?|15\s*(?:mins?|minutes?))\b', lower)
+        )
         prefer_hour = bool(re.search(r'\b(hours?|hrs?)\b', lower))
         
         hours_groups = []
@@ -33,6 +35,7 @@ class TimeParser:
         if time_ranges:
             hours_groups.extend(time_ranges["hours"])
             slot_groups.extend(time_ranges["slots"])
+            prefer_quarter = prefer_quarter or time_ranges.get("prefers_slots", False)
         
         # 2. Parse "H to H hrs/hours"
         # These are explicit hour requests (e.g., "6-8 hrs" -> 06:00 to 08:00 -> Blocks 7,8)
@@ -97,6 +100,8 @@ class TimeParser:
                 "hours": None,
                 "slots": sorted(set(all_slots))
             })
+            # If we found explicit slots (15-min precision), prefer quarter granularity
+            prefer_quarter = True
         
         # Prefer hour or quarter based on hints
         if result:
@@ -116,6 +121,7 @@ class TimeParser:
         
         hour_groups = []
         slot_groups = []
+        prefers_slots = False
         
         for m in pattern.finditer(text):
             h1 = int(m.group(1))
@@ -136,19 +142,20 @@ class TimeParser:
             end_block = min(24, H2 + (0 if m2 == 0 else 1))
             if m2 == 0:
                 end_block = max(1, H2)
-            
+
             if end_block >= start_block:
                 hour_groups.append((start_block, end_block))
             
             # 15-min slots (1-96)
             sslot = max(1, min(96, (H1 * 60 + m1 + 14) // 15 + 1))
             eslot = max(1, min(96, (H2 * 60 + m2) // 15))
-            
+
             if eslot >= sslot:
                 slot_groups.append((sslot, eslot))
-        
+                prefers_slots = prefers_slots or m1 % 15 != 0 or m2 % 15 != 0 or m1 != 0 or m2 != 0
+
         if hour_groups or slot_groups:
-            return {"hours": hour_groups, "slots": slot_groups}
+            return {"hours": hour_groups, "slots": slot_groups, "prefers_slots": prefers_slots}
         return None
     
     def _parse_hour_ranges(self, text: str) -> List[tuple]:

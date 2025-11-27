@@ -26,13 +26,14 @@ class EnhancedResponseBuilder:
         derivative_data: List[Dict],
         insights: List[str],
         derivative_note: Optional[str] = None,
+        total_market_vol: float = 0.0,
     ) -> str:
         """
         Build a full “executive dashboard” for the chat message.
         """
 
         # 1. KPI strip (MCP, volume, bids)
-        stats_html = self._build_stats_row(primary_market, market_data)
+        stats_html = self._build_stats_row(primary_market, market_data, total_market_vol)
 
         # 2. Market comparison (DAM / GDAM / RTM vs prev year)
         comparison_html = self._build_comparison_table(market_data, prev_year_data)
@@ -75,10 +76,10 @@ class EnhancedResponseBuilder:
     # ------------------------------------------------------------------
     #   KPI STRIP
     # ------------------------------------------------------------------
-    def _build_stats_row(self, market: str, all_data: Dict) -> str:
+    def _build_stats_row(self, market: str, all_data: Dict, total_volume: float) -> str:
         data = all_data.get(market, {})
         price = data.get("twap", 0)
-        vol = data.get("total_volume_gwh", 0)
+        market_vol = data.get("total_volume_gwh", 0)
 
         # Bids data
         buy_bids = data.get("purchase_bid_total_mw", 0)
@@ -100,9 +101,9 @@ class EnhancedResponseBuilder:
           </div>
 
           <div class="stat-card">
-            <div class="stat-label">{market} Volume</div>
-            <div class="stat-value">{vol:.1f}<span class="stat-unit">GWh</span></div>
-            <div class="stat-trend">Total Traded Volume</div>
+            <div class="stat-label">Total Traded Volume</div>
+            <div class="stat-value">{total_volume:.1f}<span class="stat-unit">GWh</span></div>
+            <div class="stat-trend">{market} share: {market_vol:.1f} GWh</div>
           </div>
 
           <div class="stat-card">
