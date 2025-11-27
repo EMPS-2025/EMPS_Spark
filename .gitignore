@@ -44,7 +44,7 @@ ENV/
 .DS_Store
 
 # Chainlit
-.chainlit/
+#.chainlit/
 .files/
 chainlit.db
 *.db
